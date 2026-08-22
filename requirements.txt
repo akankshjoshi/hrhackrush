@@ -5,4 +5,5 @@ openpyxl
 pyarrow
 plotly
 matplotlib
-seabornscikit-learn
+seaborn
+scikit-learn
