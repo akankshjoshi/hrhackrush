@@ -1,9 +1,13 @@
-streamlit
+streamlit>=1.45
 pandas
 numpy
+requests
+pypdf
+python-docx
 openpyxl
 pyarrow
-plotly
 matplotlib
-seaborn
 scikit-learn
+# webhook server (optional; not needed on Streamlit Cloud)
+fastapi
+uvicorn

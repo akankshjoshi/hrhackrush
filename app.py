@@ -1,395 +1,395 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import os
-import glob
+"""Anicca: explainable screening co-pilot for high-volume hiring.
+
+Run locally:  streamlit run app.py
+Optional:     uvicorn webhook_server:app --port 8000   (auto-ingest from ATS / Zapier / LinkedIn partner feed)
+"""
+from __future__ import annotations
+
+import json
 import re
-import time
-from sklearn.feature_extraction.text import TfidfVectorizer
-import matplotlib.pyplot as plt
 
-st.set_page_config(
-    page_title="Anicca Talent Decision Intelligence Platform",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import pandas as pd
+import streamlit as st
 
-# Custom High-Contrast Styling
+from anicca.demo import demo_applicants
+from anicca.ingest import ingest_csv, ingest_email_bytes, ingest_file, ingest_text, poll_imap
+from anicca.llm import PROVIDERS, LLMError, get_client
+from anicca.parsing import mask_pii
+from anicca.scoring import (BACKUP, JOB_PROFILES, NO_MATCH, REVIEW, SHORTLIST, Settings, adverse_impact,
+                            explain, jd_to_profile, score)
+from anicca.store import Store
+
+st.set_page_config(page_title="Anicca Screening Co-pilot", page_icon="⚡", layout="wide")
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
-    html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', sans-serif; }
-    .stApp { background-color: #0b1120; color: #f8fafc; }
-    .metric-card-3d {
-        background: linear-gradient(145deg, #1e293b, #0f172a);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 14px;
-        padding: 16px 20px;
-        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
-        transition: transform 0.2s ease;
-    }
-    .metric-card-3d:hover { transform: translateY(-2px); border-color: rgba(56, 189, 248, 0.4); }
-    .metric-title { color: #94a3b8; font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
-    .metric-value { font-size: 1.85rem; font-weight: 800; color: #ffffff; margin-top: 4px; }
-    .metric-badge { font-size: 0.7rem; font-weight: 700; padding: 3px 8px; border-radius: 6px; display: inline-block; margin-top: 6px; }
-</style>
-""", unsafe_allow_html=True)
+  .block-container {padding-top: 1.6rem;}
+  div[data-testid="stMetric"] {background: rgba(148,163,184,.08); border: 1px solid rgba(148,163,184,.25);
+       border-radius: 12px; padding: 12px 16px;}
+  .pill {display:inline-block; padding:2px 10px; border-radius:999px; font-size:.8rem; margin-right:6px;
+       background: rgba(56,189,248,.15); border:1px solid rgba(56,189,248,.4);}
+  .flag {color:#f59e0b;}
+</style>""", unsafe_allow_html=True)
 
-# 1. LOAD FULL DATASET (5000+ Profiles)
-@st.cache_data
-def load_talent_pool():
-    n = 5000
-    skills_pool = [
-        "Selenium, Playwright, PyTest, QA Automation, Postman, JUnit, JMeter, CI/CD, TestNG, Java, REST API",
-        "Python, SQL, PySpark, Spark, AWS, Airflow, Kafka, ETL, Data Warehouse, Snowflake, Databricks",
-        "JavaScript, React, Node.js, TypeScript, HTML, CSS, Next.js, PostgreSQL, GraphQL, Docker, Tailwind",
-        "AWS, Docker, Kubernetes, Terraform, CI/CD, Jenkins, Linux, Ansible, Helm, Prometheus, Grafana",
-        "Python, Machine Learning, Scikit-Learn, Pandas, NumPy, Statistics, PyTorch, TensorFlow, SQL",
-        "Java, Spring Boot, Microservices, MySQL, REST API, Redis, Kafka, PostgreSQL, Docker"
-    ]
-    worker_pool = ["Contingent / Freelance", "Full-Time Corporate", "Contractor / Gig", "Full-Time Corporate"]
-    inst_pool = ["Regional State University", "Tier-1 Elite (IIT/NIT/BITS)", "Tier-2/3 College", "Regional State University"]
 
-    cids = [f"Resume_Viral_{i:05d}" for i in range(1, n + 1)]
-    edus = ["Master's Degree" if i % 3 == 0 else "Bachelor's Degree" for i in range(n)]
-    exps = [round(float((i % 10) + 1.2), 1) for i in range(n)]
-    skills_arr = [skills_pool[i % len(skills_pool)] for i in range(n)]
-    workers = [worker_pool[i % len(worker_pool)] for i in range(n)]
-    gaps = [2.5 if i % 4 == 0 else (1.0 if i % 7 == 0 else 0.0) for i in range(n)]
-    sectors = ["Non-Tech Transition" if i % 4 == 0 else "Pure Tech" for i in range(n)]
-    tiers = [inst_pool[i % len(inst_pool)] for i in range(n)]
-    auth_scores = [85.0 if (i % 2 == 0 or i % 5 == 0) else (50.0 if i % 3 == 0 else 70.0) for i in range(n)]
-    timeline_statuses = ["⚠️ Anomaly Detected (Project Exceeds Employer Tenure)" if (i % 7 == 0 or i % 11 == 0) else "✅ Verified" for i in range(n)]
+@st.cache_resource
+def get_store() -> Store:
+    return Store()
 
-    df = pd.DataFrame({
-        "Candidate ID": cids,
-        "Education": edus,
-        "Experience (Years)": exps,
-        "Skills": skills_arr,
-        "Worker Type": workers,
-        "Career Gap (Years)": gaps,
-        "Sector Background": sectors,
-        "Institution Tier": tiers,
-        "Authenticity Score": auth_scores,
-        "Timeline Integrity Status": timeline_statuses,
-        "Labour Law 2025 Status": "COMPLIANT (Zero Protected Trait Reliance)",
-        "DEI & SDG Status": "SDG 5/8/10 Certified"
+
+store = get_store()
+ss = st.session_state
+ss.setdefault("profiles", {k: dict(v) for k, v in JOB_PROFILES.items()})
+ss.setdefault("explanations", {})
+
+# ======================================================================= SIDEBAR
+with st.sidebar:
+    st.markdown("### ⚡ Anicca")
+    st.caption("Screening co-pilot: ranks every applicant with reasons, flags inconsistencies, keeps an audit trail.")
+
+    with st.expander("🤖 AI assistant (free LLMs)", expanded=False):
+        provider = st.selectbox("Provider", ["Off (rule-based only)"] + list(PROVIDERS), key="provider")
+        api_key, model = "", ""
+        if provider in PROVIDERS:
+            cfg = PROVIDERS[provider]
+            model = st.text_input("Model", value=cfg["default_model"], key="model",
+                                  help="Free-tier model IDs change; edit if the provider renames them.")
+            if not provider.startswith("Ollama"):
+                api_key = st.text_input(f"API key (or set {cfg['env_key']} in secrets)", type="password",
+                                        key="api_key", help="Kept only for this browser session.")
+            st.caption(f"Get a free key: {cfg['signup']}")
+        client = get_client(provider, api_key, model)
+        if provider in PROVIDERS and client is None:
+            st.warning("No key found: using the rule-based engine.")
+        elif client is not None and st.button("Test connection"):
+            try:
+                st.success("Connected: " + client.chat("Reply with OK.", "ping", max_tokens=5)[:20])
+            except LLMError as e:
+                st.error(str(e))
+
+    st.markdown("#### 🎯 Job")
+    job_options = list(dict.fromkeys(list(ss.profiles) + store.jobs()))
+    if "_pending_job" in ss:  # set before the widget exists; Streamlit forbids changing it afterwards
+        ss.job = ss.pop("_pending_job")
+    job = st.selectbox("Screening for", job_options + ["➕ New job from a job description"], key="job")
+    if job == "➕ New job from a job description":
+        new_title = st.text_input("Job title", "Backend Engineer")
+        jd = st.text_area("Paste the job description", height=180)
+        if st.button("Extract criteria", type="primary", disabled=not jd.strip()):
+            prof = jd_to_profile(jd, client)
+            ss.profiles[new_title] = {k: prof[k] for k in ("mandatory", "preferred", "min_exp")}
+            if prof.get("llm_error"):
+                st.warning("AI unavailable, used rules: " + prof["llm_error"][:120])
+            ss["_pending_job"] = new_title
+            st.rerun()
+        st.stop()
+
+    prof = ss.profiles.setdefault(job, {"mandatory": [], "preferred": [], "min_exp": 2.0})
+    mand = st.text_input("Must-have skills", ", ".join(prof["mandatory"]), key=f"mand_{job}")
+    pref = st.text_input("Nice-to-have skills", ", ".join(prof["preferred"]), key=f"pref_{job}")
+    split = lambda s: [x.strip().lower() for x in s.split(",") if x.strip()]
+    min_exp = st.slider("Minimum experience (years)", 0.0, 12.0, float(prof["min_exp"]), 0.5, key=f"exp_{job}")
+
+    st.markdown("#### 📋 Shortlist")
+    c1, c2 = st.columns(2)
+    top_k = c1.number_input("Interview slots", 1, 200, 10)
+    backup_k = c2.number_input("Backups", 0, 100, 5)
+    floor = st.slider("Minimum score to shortlist", 30, 90, 60, 5,
+                      help="Nobody below this score is shortlisted, even if slots stay empty.")
+    with st.expander("Scoring weights"):
+        w_mand = st.slider("Must-have skills (%)", 40, 80, 60, 5)
+        w_pref = st.slider("Nice-to-have skills (%)", 10, 40, 25, 5)
+        st.caption(f"Experience: **{100 - w_mand - w_pref}%**")
+
+    st.markdown("#### ⚖️ Fairness & integrity")
+    fairness = st.toggle("Don't penalize career gaps or freelance work", True)
+    spec_adj = st.toggle("Adjust for generic / AI-polished wording", True)
+    timeline = st.toggle("Flag timeline inconsistencies", True)
+
+settings = Settings(split(mand), split(pref), min_exp, int(top_k), int(backup_k), float(floor), w_mand, w_pref,
+                    fairness, spec_adj, timeline)
+
+
+# ======================================================================= DATA
+def candidate_frame(job_name: str) -> pd.DataFrame:
+    df = store.to_frame(job_name)
+    if df.empty:
+        return df
+    p = pd.json_normalize(df["parsed"].tolist())
+    i = pd.json_normalize(df["integrity"].tolist())
+    get = lambda frame, col, default: frame[col] if col in frame else pd.Series([default] * len(frame))
+    return pd.DataFrame({
+        "id": df["id"], "name": df["name"].replace("", "(no name)"), "source": df["source"],
+        "status": df["status"], "received_at": df["received_at"], "text": df["raw_text"],
+        "dupes": df["duplicate_sources"].apply(len),
+        "skills": get(p, "skills", []), "experience_years": get(p, "experience_years", 0.0),
+        "career_gap_years": get(p, "career_gap_years", 0.0), "worker_type": get(p, "worker_type", ""),
+        "education": get(p, "education", ""), "parsed_by": get(p, "parsed_by", "rules"),
+        "summary": get(p, "summary", ""),
+        "specificity_score": get(i, "specificity_score", 60), "polish_flags": get(i, "polish_flags", []),
+        "timeline_status": get(i, "timeline_status", ""), "timeline_flags": get(i, "timeline_flags", []),
     })
 
-    # Inject Duplicate records
-    dup_sample = df.iloc[:150].copy()
-    dup_sample["Candidate ID"] = [f"{cid}_REAPPLY_DUP" for cid in dup_sample["Candidate ID"]]
-    return pd.concat([df, dup_sample], ignore_index=True)
 
-# 2. DEDUPLICATION ENGINE
-@st.cache_data
-def deduplicate_at_scale(df, threshold=0.88):
-    df = df.copy().reset_index(drop=True)
-    tfidf = TfidfVectorizer(max_features=300).fit_transform(df["Skills"].fillna("").astype(str).str.lower())
-    sim_sparse = tfidf * tfidf.T
+cands = candidate_frame(job)
+ranked, info = score(cands, settings) if not cands.empty else (cands, {"eligible": 0, "quota_short": 0})
 
-    rows, cols = sim_sparse.nonzero()
-    mask = (rows < cols) & (sim_sparse.data >= threshold)
-    match_rows, match_cols = rows[mask], cols[mask]
+# ======================================================================= HEADER
+st.title("Anicca Screening Co-pilot")
+st.caption(f"Job: **{job}** · Must-haves: {', '.join(settings.mandatory) or '—'} · "
+           f"AI: {'on (' + client.model + ')' if client else 'off, rule-based'}")
 
-    to_drop = set()
-    dedup_logs = []
+m1, m2, m3, m4, m5 = st.columns(5)
+n = len(ranked)
+m1.metric("Applicants", n)
+m2.metric("Duplicates merged", int(cands["dupes"].sum()) if n else 0)
+m3.metric("Shortlisted", f"{int((ranked['Decision'] == SHORTLIST).sum()) if n else 0} / {settings.top_k}")
+m4.metric("Need your review", int((ranked["Triage"] == REVIEW).sum()) if n else 0)
+m5.metric("Channels", ranked["source"].nunique() if n else 0)
 
-    for r, c in zip(match_rows, match_cols):
-        if c in to_drop or r in to_drop: continue
-        exp_r = df.loc[r, "Experience (Years)"]
-        exp_c = df.loc[c, "Experience (Years)"]
-        if abs(exp_r - exp_c) <= 1.0:
-            to_drop.add(c)
-            if len(dedup_logs) < 150:
-                dedup_logs.append({
-                    "Primary Master ID": df.loc[r, "Candidate ID"],
-                    "Merged Duplicate ID": df.loc[c, "Candidate ID"],
-                    "Semantic Overlap": f"{sim_sparse[r, c] * 100:.1f}%"
-                })
+tab_inbox, tab_short, tab_review, tab_fair, tab_setup = st.tabs(
+    ["📥 Applicant inbox", "📋 Shortlist", "🔎 Candidate review", "⚖️ Fairness & audit", "🔌 Integrations"])
 
-    df_clean = df.drop(index=list(to_drop)).reset_index(drop=True)
-    return df_clean, dedup_logs
 
-JOB_PROFILES = {
-    "QA Automation Engineer": {
-        "mandatory": ["selenium", "playwright", "pytest", "automation testing", "postman"],
-        "preferred": ["ci/cd", "jenkins", "docker", "jmeter", "java", "sql"],
-        "min_exp": 3.0
-    },
-    "Data Engineer": {
-        "mandatory": ["python", "sql", "spark", "etl", "data warehouse", "airflow"],
-        "preferred": ["aws", "kafka", "snowflake", "databricks", "docker", "kubernetes"],
-        "min_exp": 3.0
-    },
-    "DevOps & Cloud Engineer": {
-        "mandatory": ["aws", "docker", "kubernetes", "terraform", "ci/cd", "linux"],
-        "preferred": ["ansible", "jenkins", "prometheus", "grafana", "python", "bash"],
-        "min_exp": 3.5
-    },
-    "Full Stack Developer": {
-        "mandatory": ["javascript", "react", "node.js", "typescript", "html", "css"],
-        "preferred": ["next.js", "postgresql", "mongodb", "docker", "graphql", "tailwind"],
-        "min_exp": 2.5
-    },
-    "Data Scientist / ML Engineer": {
-        "mandatory": ["python", "machine learning", "scikit-learn", "pandas", "numpy", "statistics"],
-        "preferred": ["pytorch", "tensorflow", "nlp", "llm", "deep learning", "docker", "aws"],
-        "min_exp": 3.0
-    },
-    "Senior Backend Engineer": {
-        "mandatory": ["java", "spring boot", "microservices", "sql", "rest api"],
-        "preferred": ["kafka", "redis", "docker", "kubernetes", "aws", "postgresql"],
-        "min_exp": 4.0
-    },
-    "Custom Job Description": {
-        "mandatory": ["python", "sql", "docker"],
-        "preferred": ["aws", "ci/cd", "kubernetes"],
-        "min_exp": 2.0
-    }
-}
+def show_results(results: list[dict]) -> None:
+    """Keep the import summary, then rerun so the header counts and shortlist include the new applicants."""
+    ss["last_results"] = results
+    st.rerun()
 
-TRANSFERABLE_MAP = {
-    "pyspark": "spark", "data pipeline": "etl", "data warehousing": "data warehouse",
-    "k8s": "kubernetes", "postgres": "postgresql", "automation": "automation testing",
-    "rest": "rest api", "testing": "automation testing", "ml": "machine learning"
-}
 
-# 3. VECTORIZED EVALUATION & TRIAGE ENGINE
-def evaluate_11_constraints_surge(df, mand_list, pref_list, min_exp_req, top_k_val, back_k_val, mand_pct, pref_pct, exp_pct, enable_fairness, filter_ai_fluff, enforce_timeline_audit):
-    t_start = time.time()
-    df = df.copy().reset_index(drop=True)
-    n = len(df)
+def render_last_results() -> None:
+    results = ss.pop("last_results", None)
+    if not results:
+        return
+    s = pd.Series([r["status"] for r in results]).value_counts().to_dict()
+    st.success(f"Added {s.get('added', 0)} · merged {s.get('duplicate', 0)} duplicates · "
+               f"skipped {s.get('skipped', 0)} · errors {s.get('error', 0)}")
+    bad = [r for r in results if r["status"] in ("skipped", "error") or r.get("llm_error")]
+    if bad:
+        with st.expander("Details"):
+            st.dataframe(pd.DataFrame(bad), hide_index=True, width="stretch")
 
-    if n == 0:
-        return df, 0.0
 
-    skills_series = df["Skills"].fillna("").astype(str).str.lower()
-    for src, tgt in TRANSFERABLE_MAP.items():
-        skills_series = skills_series.str.replace(src, tgt, regex=False)
+# ======================================================================= INBOX
+with tab_inbox:
+    st.markdown("Every channel lands here, gets parsed, de-duplicated across sources and scored for the job.")
+    render_last_results()
+    target_job = st.selectbox("Assign new applicants to", job_options, index=job_options.index(job))
+    use_ai = st.checkbox("Use AI to read resumes during import", value=client is not None, disabled=client is None,
+                         help="Better extraction of roles and dates. Free tiers allow roughly 30 requests/minute.")
+    ai = client if use_ai else None
 
-    mand_counts = np.zeros(n, dtype=float)
-    for m in mand_list:
-        mand_counts += skills_series.str.contains(m.lower(), regex=False, na=False).astype(float).values
-    mand_scores = (mand_counts / max(1, len(mand_list))) * mand_pct
+    a, b, c = st.columns(3)
+    with a:
+        st.markdown("**Resumes (PDF, DOCX, TXT or ZIP)**")
+        st.caption("Includes resumes downloaded from your LinkedIn job post, Naukri or any ATS.")
+        files = st.file_uploader("Resumes", type=["pdf", "docx", "txt", "zip"], accept_multiple_files=True,
+                                 label_visibility="collapsed")
+        src = st.selectbox("Where did these come from?", ["LinkedIn (download)", "Naukri", "Indeed", "Referral",
+                                                          "Careers page", "Upload"], index=0)
+        if st.button("Import resumes", disabled=not files, type="primary"):
+            res, bar = [], st.progress(0.0)
+            for k, f in enumerate(files):
+                res += ingest_file(store, f.name, f.getvalue(), job=target_job, source=src, client=ai)
+                bar.progress((k + 1) / len(files))
+            show_results(res)
+    with b:
+        st.markdown("**Spreadsheet (CSV)**")
+        st.caption("Columns: name, email, phone, and resume_text / summary / skills / experience.")
+        csv = st.file_uploader("CSV", type=["csv"], label_visibility="collapsed")
+        if st.button("Import CSV", disabled=csv is None):
+            res = None
+            try:
+                res = ingest_csv(store, csv.getvalue(), job=target_job, client=ai)
+            except ValueError as e:
+                st.error(str(e))
+            if res is not None:
+                show_results(res)
+    with c:
+        st.markdown("**Application emails (.eml)**")
+        st.caption("LinkedIn, Naukri and Indeed notification emails with resume attachments.")
+        emls = st.file_uploader("Emails", type=["eml"], accept_multiple_files=True, label_visibility="collapsed")
+        if st.button("Import emails", disabled=not emls):
+            res = []
+            for f in emls:
+                res += ingest_email_bytes(store, f.getvalue(), job=target_job, client=ai)
+            show_results(res)
+        with st.popover("Connect a mailbox (IMAP)"):
+            st.caption("Use a Gmail/Outlook **app password** and a dedicated label, e.g. a filter that labels "
+                       "mails from jobs-noreply@linkedin.com as 'Applicants'.")
+            host = st.text_input("IMAP host", "imap.gmail.com")
+            user = st.text_input("Email address")
+            pw = st.text_input("App password", type="password")
+            folder = st.text_input("Folder / label", "Applicants")
+            if st.button("Fetch new applications", disabled=not (user and pw)):
+                res = None
+                try:
+                    res = poll_imap(store, host=host, user=user, password=pw, folder=folder,
+                                    job=target_job, client=ai)
+                except Exception as e:
+                    st.error(f"Mailbox error: {e}")
+                if res is not None:  # outside the try: st.rerun() works by raising an exception
+                    show_results(res)
 
-    pref_counts = np.zeros(n, dtype=float)
-    for p in pref_list:
-        pref_counts += skills_series.str.contains(p.lower(), regex=False, na=False).astype(float).values
-    pref_scores = (pref_counts / max(1, len(pref_list))) * pref_pct
+    st.divider()
+    d1, d2, _ = st.columns([1, 1, 3])
+    if d1.button("Load demo applicants"):
+        show_results([ingest_text(store, a["text"], job=a["job"], source=a["source"]) for a in demo_applicants()])
+    confirm = d2.checkbox("Confirm clear")
+    if d2.button("Clear all applicants", disabled=not confirm):
+        store.clear()
+        st.rerun()
 
-    exps = df["Experience (Years)"].fillna(0.0).astype(float).values
-    gaps = df["Career Gap (Years)"].fillna(0.0).astype(float).values
-    worker_series = df["Worker Type"].fillna("").astype(str)
-
-    if enable_fairness:
-        has_gap = gaps > 0
-        is_non_trad = worker_series.str.contains("Contingent|Gig|Freelance", case=False, na=False).values
-        is_regularized = has_gap | is_non_trad
-        effective_exps = np.where(is_regularized, np.maximum(exps, min_exp_req * 0.90), exps)
+    allapps = store.to_frame()
+    if allapps.empty:
+        st.info("No applicants yet. Import resumes above, or click **Load demo applicants** to try it.")
     else:
-        effective_exps = exps
+        view = allapps[["name", "job", "source", "received_at", "status"]].copy()
+        view["also applied via"] = allapps["duplicate_sources"].apply(lambda d: ", ".join(x["source"] for x in d))
+        view["read by"] = allapps["parsed"].apply(lambda p: p.get("parsed_by", "rules"))
+        st.dataframe(view, hide_index=True, width="stretch", height=320)
 
-    exp_scores = np.where(effective_exps >= min_exp_req, exp_pct, (effective_exps / max(0.1, min_exp_req)) * exp_pct)
-    total_scores = mand_scores + pref_scores + exp_scores
+# ======================================================================= SHORTLIST
+with tab_short:
+    if not n:
+        st.info("No applicants for this job yet. Add some in the Applicant inbox.")
+    else:
+        if info["quota_short"]:
+            st.warning(f"Only {info['eligible']} applicants meet the minimum score of {settings.score_floor:g}. "
+                       f"{info['quota_short']} interview slots stay open rather than filling them with weak matches.")
+        decisions = st.multiselect("Show", [SHORTLIST, BACKUP, "Not shortlisted"], default=[SHORTLIST, BACKUP])
+        show = ranked[ranked["Decision"].isin(decisions)] if decisions else ranked
+        st.dataframe(
+            show[["Rank", "name", "Score", "Decision", "Triage", "experience_years", "source", "status", "Reasons"]],
+            hide_index=True, width="stretch", height=460,
+            column_config={
+                "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f"),
+                "name": "Candidate", "experience_years": st.column_config.NumberColumn("Years", format="%.1f"),
+                "Reasons": st.column_config.TextColumn("Why", width="large"),
+                "source": "Channel", "status": "Status",
+            })
+        export = ranked.drop(columns=["text", "skills", "mand_hit", "pref_hit", "polish_flags", "timeline_flags"])
+        st.download_button("Download shortlist (CSV)", export.to_csv(index=False).encode(),
+                           file_name=f"shortlist_{re.sub(r'[^A-Za-z0-9]+', '_', job)}.csv")
 
-    if filter_ai_fluff:
-        auth_scores = df["Authenticity Score"].fillna(75.0).astype(float).values
-        total_scores = np.where(auth_scores >= 80.0, np.minimum(100.0, total_scores + 3.0), total_scores)
-        total_scores = np.where(auth_scores < 60.0, np.maximum(0.0, total_scores - 4.0), total_scores)
+# ======================================================================= CANDIDATE REVIEW
+with tab_review:
+    if not n:
+        st.info("No applicants for this job yet.")
+    else:
+        labels = {f"#{r.Rank} · {r.name} · {r.Score:g} · {r.Decision}": r.id for r in ranked.itertuples()}
+        pick = st.selectbox("Candidate", list(labels))
+        r = ranked[ranked["id"] == labels[pick]].iloc[0]
+        left, right = st.columns([1.1, 1])
+        with left:
+            st.markdown(f"### {r['name']}  \n<span class='pill'>{r['Decision']}</span>"
+                        f"<span class='pill'>{r['Triage']}</span><span class='pill'>{r['source']}</span>",
+                        unsafe_allow_html=True)
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Score", f"{r['Score']:g}")
+            k2.metric("Experience", f"{r['experience_years']:g} yrs")
+            k3.metric("Specificity", int(r["specificity_score"]),
+                      help="How concrete the resume is (numbers, tools, outcomes). Low = ask for evidence.")
+            st.markdown("**Why this score**")
+            for part in r["Reasons"].split(" · "):
+                st.markdown(f"- {part}")
+            st.markdown("**Must-haves found:** " + (", ".join(r["mand_hit"]) or "none"))
+            flags = list(r["timeline_flags"] or []) + list(r["polish_flags"] or [])
+            if flags:
+                st.markdown("**Integrity flags (verify in interview, never auto-reject)**")
+                for f in flags:
+                    st.markdown(f"<span class='flag'>⚠ {f}</span>", unsafe_allow_html=True)
+            if r["summary"]:
+                st.caption(r["summary"])
+        with right:
+            st.markdown("**AI assessment**")
+            if client is None:
+                st.caption("Turn on a free LLM in the sidebar for strengths, gaps and interview questions. "
+                           "It never changes the score.")
+            else:
+                key = f"{r['id']}|{job}|{','.join(settings.mandatory)}"
+                if st.button("Generate AI assessment", type="primary"):
+                    try:
+                        ss.explanations[key] = explain(client, settings, r["text"], r["Reasons"], job)
+                        store.log("ai", r["id"], "ai_assessment", client.model)
+                    except LLMError as e:
+                        st.error(str(e))
+                ex = ss.explanations.get(key)
+                if ex:
+                    st.info(ex.get("one_line", ""))
+                    st.markdown("**Strengths**\n" + "\n".join(f"- {x}" for x in ex.get("strengths", [])))
+                    st.markdown("**Gaps**\n" + "\n".join(f"- {x}" for x in ex.get("gaps", [])))
+                    st.markdown("**Ask in the interview**\n" +
+                                "\n".join(f"1. {x}" for x in ex.get("interview_questions", [])))
+            st.markdown("**Your decision**")
+            note = st.text_input("Note (saved to the audit log)", key=f"note_{r['id']}")
+            b1, b2, b3 = st.columns(3)
+            for col, status in ((b1, "Interview"), (b2, "On hold"), (b3, "Rejected")):
+                if col.button(status, key=f"{status}_{r['id']}", width="stretch"):
+                    store.set_status(r["id"], status, note=note)
+                    st.toast(f"{r['name']}: {status}")
+            st.caption(f"Current status: **{r['status']}**")
+        with st.expander("Resume text (contact details and protected attributes masked)"):
+            st.text(mask_pii(r["text"])[:8000])
+        with st.expander("Delete this candidate's data (data-protection request)"):
+            if st.checkbox("I confirm this candidate asked for deletion", key=f"del_{r['id']}") and \
+                    st.button("Delete permanently", key=f"delbtn_{r['id']}"):
+                store.delete(r["id"])
+                st.rerun()
 
-    is_anomaly = df["Timeline Integrity Status"].astype(str).str.contains("Anomaly", case=False, na=False).values
-    if enforce_timeline_audit:
-        total_scores = np.where(is_anomaly, np.maximum(0.0, total_scores - 15.0), total_scores)
+# ======================================================================= FAIRNESS & AUDIT
+with tab_fair:
+    if not n:
+        st.info("Fairness and audit reports appear once applicants are scored.")
+    else:
+        st.markdown("Anicca never collects or scores gender, age, religion, caste or college name. "
+                    "These checks look for unfair outcomes on the signals it *does* see.")
+        x = ranked.assign(**{"Career gap": ranked["career_gap_years"].gt(0.5).map({True: "Has gap", False: "No gap"}),
+                             "Work type": ranked["worker_type"].replace("", "Unknown"), "Channel": ranked["source"]})
+        f1, f2 = st.columns(2)
+        with f1:
+            grp = st.selectbox("Selection rate by", ["Career gap", "Work type", "Channel"])
+            st.dataframe(adverse_impact(x, grp), hide_index=True, width="stretch")
+            st.caption("Impact ratio = group's shortlist rate ÷ best group's rate. Below 0.8 fails the four-fifths rule.")
+        with f2:
+            st.markdown("**Triage mix**")
+            st.bar_chart(ranked["Triage"].value_counts())
+        st.markdown("**Audit log**")
+        audit = store.audit_frame()
+        st.dataframe(audit.head(300), hide_index=True, width="stretch", height=260)
+        pack = {"job": job, "criteria": settings.__dict__, "results": json.loads(
+            ranked[["id", "name", "Score", "Decision", "Triage", "Reasons"]].to_json(orient="records")),
+            "audit_log": json.loads(audit.to_json(orient="records"))}
+        st.download_button("Download audit pack (JSON)", json.dumps(pack, indent=2, default=str).encode(),
+                           file_name="anicca_audit_pack.json")
 
-    final_scores = np.round(np.clip(total_scores, 0.0, 100.0), 1)
+# ======================================================================= INTEGRATIONS
+with tab_setup:
+    st.markdown("""
+### How applicants reach Anicca
 
-    # Dynamic Constraint 10 Triage Calculation
-    is_borderline = (final_scores >= 62.0) & (final_scores <= 75.0)
-    has_conflicts = is_borderline & (is_anomaly | (gaps > 2.0))
+| Channel | Status | How |
+|---|---|---|
+| **LinkedIn job posts** | ✅ Works today | Download applicant resumes from your LinkedIn job post → upload the PDFs or a ZIP in the inbox. |
+| **LinkedIn / Naukri / Indeed emails** | ✅ Works today | Gmail filter on the sender → label `Applicants` → *Connect a mailbox*. Or upload `.eml` files. |
+| **Any ATS, Google Form, Typeform, Zapier, Make** | ✅ Works today | POST to the webhook server (below). |
+| **LinkedIn Easy Apply, automatic** | 🔒 Needs LinkedIn partner access | LinkedIn has no public API for Easy Apply applicants. Apply to LinkedIn's ATS partner programme; the adapter `anicca/linkedin.py` + `POST /webhook/linkedin` are ready to map its feed. Never scrape LinkedIn: it breaks their terms. |
 
-    triage_decisions = np.where(final_scores >= 76.0, "⚡ Auto-Pass (High Confidence)",
-                       np.where(has_conflicts, "👤 Escalated to Human Review (Borderline Ambiguity)",
-                       np.where(final_scores < 45.0, "🤖 Auto-Reject (Clear Gap)",
-                       "⚡ Auto-Resolved by Policy (Low Risk)")))
+### Webhook
+Run `ANICCA_WEBHOOK_TOKEN=<secret> uvicorn webhook_server:app --port 8000`, then:
+```bash
+curl -X POST https://<your-host>/webhook/applications \\
+  -H "X-Anicca-Token: <secret>" -H "Content-Type: application/json" \\
+  -d '{"job": "QA Automation Engineer", "source": "Careers page",
+       "candidate": {"name": "Asha Rao", "email": "asha@example.com"},
+       "resume": {"filename": "asha.pdf", "content_base64": "<base64>"}}'
+```
+`resume.text` works instead of a file. Send a list to post up to 200 applicants at once.
 
-    df_result = df.copy()
-    df_result["Overall Score"] = final_scores
-    df_result[f"Mandatory ({mand_pct}%)"] = np.round(mand_scores, 1)
-    df_result[f"Preferred ({pref_pct}%)"] = np.round(pref_scores, 1)
-    df_result[f"Experience ({exp_pct}%)"] = np.round(exp_scores, 1)
-    df_result["Review Triage Status (C10)"] = triage_decisions
-    df_result["Unit Screening Cost (C11)"] = "₹0.30 / candidate"
-
-    df_sorted = df_result.sort_values(by="Overall Score", ascending=False).reset_index(drop=True)
-    df_sorted.insert(0, "Rank", np.arange(1, len(df_sorted) + 1))
-
-    recs = np.empty(len(df_sorted), dtype=object)
-    top_limit = min(top_k_val, len(df_sorted))
-    backup_limit = min(top_k_val + back_k_val, len(df_sorted))
-
-    recs[:top_limit] = "SELECTED (Interview)"
-    recs[top_limit:backup_limit] = "BACKUP CANDIDATE"
-    recs[backup_limit:] = "REJECTED"
-    df_sorted["Recommendation"] = recs
-
-    eval_time = time.time() - t_start
-    return df_sorted, eval_time
-
-# --- SIDEBAR CONTROLS ---
-st.sidebar.markdown("### ⚡ Recruiter Command Center")
-selected_role = st.sidebar.selectbox("🎯 Target Job Description", list(JOB_PROFILES.keys()))
-role_data = JOB_PROFILES[selected_role]
-
-if selected_role == "Custom Job Description":
-    custom_mand_str = st.sidebar.text_input("Mandatory Skills (comma separated)", "python, sql, docker")
-    custom_pref_str = st.sidebar.text_input("Preferred Skills (comma separated)", "aws, ci/cd, kubernetes")
-    active_mand_skills = [s.strip().lower() for s in custom_mand_str.split(",") if s.strip()]
-    active_pref_skills = [s.strip().lower() for s in custom_pref_str.split(",") if s.strip()]
-    default_min_exp = 3.0
-else:
-    active_mand_skills = role_data["mandatory"]
-    active_pref_skills = role_data["preferred"]
-    default_min_exp = role_data["min_exp"]
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("#### ⚙️ Live Dynamic Quota")
-top_k_target = st.sidebar.number_input("Candidates to Interview (Top K)", min_value=1, max_value=100, value=10)
-backup_k_target = st.sidebar.number_input("Backup Reserve Quota", min_value=1, max_value=50, value=5)
-min_exp_slider = st.sidebar.slider("Min. Experience (Years)", 0.0, 10.0, float(default_min_exp), 0.5)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("#### ⚖️ Governance, AI Defense & Triage")
-fairness_mode = st.sidebar.toggle("Enable DEI-SDG & Labour Law 2025 Regularizer", value=True)
-ai_authenticity_mode = st.sidebar.toggle("Enable Constraint 7: AI Polish De-Biasing", value=True)
-timeline_audit_mode = st.sidebar.toggle("Enable Constraint 8: Project Timeline Integrity", value=True)
-
-mand_weight = st.sidebar.slider("Mandatory Weight (%)", 40, 80, 60, 5)
-pref_weight = st.sidebar.slider("Preferred Weight (%)", 10, 40, 25, 5)
-exp_weight = 100 - (mand_weight + pref_weight)
-st.sidebar.caption(f"Calculated Experience Weight: **{exp_weight}%**")
-
-# --- MAIN DASHBOARD VIEW ---
-st.title("⚡ Anicca Talent Decision Intelligence Platform")
-
-df_raw_pool = load_talent_pool()
-df_deduped_pool, deduplication_audit = deduplicate_at_scale(df_raw_pool)
-
-df_evaluated, eval_elapsed = evaluate_11_constraints_surge(
-    df_deduped_pool,
-    active_mand_skills,
-    active_pref_skills,
-    min_exp_slider,
-    top_k_target,
-    backup_k_target,
-    mand_weight,
-    pref_weight,
-    exp_weight,
-    fairness_mode,
-    ai_authenticity_mode,
-    timeline_audit_mode
-)
-
-# FULLY DYNAMIC METRICS
-total_processed_count = len(df_deduped_pool)
-duplicates_merged_count = len(deduplication_audit)
-human_escalated_count = int(df_evaluated["Review Triage Status (C10)"].str.contains("Escalated").sum())
-human_load_pct = (human_escalated_count / max(1, total_processed_count)) * 100
-
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    st.markdown(f"<div class='metric-card-3d'><div class='metric-title'>Surge Pool Processed</div><div class='metric-value'>{total_processed_count:,}</div><div class='metric-badge' style='background:#0284c7; color:#fff;'>C9 Scaled in {eval_elapsed:.3f}s</div></div>", unsafe_allow_html=True)
-with m2:
-    st.markdown(f"<div class='metric-card-3d'><div class='metric-title'>Duplicates Merged</div><div class='metric-value'>{duplicates_merged_count:,}</div><div class='metric-badge' style='background:#7c3aed; color:#fff;'>C1 Deduplicated</div></div>", unsafe_allow_html=True)
-with m3:
-    st.markdown(f"<div class='metric-card-3d'><div class='metric-title'>Human Review Queue (C10)</div><div class='metric-value'>{human_escalated_count:,} ({human_load_pct:.1f}%)</div><div class='metric-badge' style='background:#059669; color:#fff;'>C10 50% Capacity Optimized</div></div>", unsafe_allow_html=True)
-with m4:
-    st.markdown(f"<div class='metric-card-3d'><div class='metric-title'>Monthly Budget (C11)</div><div class='metric-value'>₹30,000</div><div class='metric-badge' style='background:#10b981; color:#fff;'>C11 ₹0.30/candidate Cost</div></div>", unsafe_allow_html=True)
-
-# AUDIT ACCORDION
-with st.expander("🛡️ 11-Constraint Compliance, Audit Logs & ₹30,000 Budget Accounting", expanded=False):
-    st.markdown("#### 1. Constraint 11 (₹30,000 Production Budget Breakdown)")
-    st.success("💰 Cost Optimization Justification: By eliminating closed-source token calls ($0.03/call) and running a local vectorized scoring engine on ARM Graviton compute, our cost per candidate is **₹0.30**, comfortably processing 100,000 applicants within the ₹30,000 monthly ceiling.")
-    st.markdown("#### 2. Constraint 10 (Recruiter Triage Optimization)")
-    st.info(f"Resolved {total_processed_count - human_escalated_count:,} profiles autonomously. Only {human_escalated_count} complex borderline profiles escalated to human reviewers.")
-    st.markdown("#### 3. Constraints 1-9 (Full Multi-Constraint Integrity)")
-    st.success("⚖️ Verified Compliance: Sub-second 50x scaling, Labour Law 2025 PII shielding, DEI-SDG parity, AI fluff screening, and timeline integrity fully certified.")
-
-# TABS
-tab1, tab2, tab3, tab4 = st.tabs(["📋 Recruiter Decision Matrix", "📊 Fairness & Triage Diagnostics", "💰 ₹30,000 Budget Justification (C11)", "📥 Enterprise Audit Deliverables"])
-
-with tab1:
-    st.subheader(f"Ranked Candidate Roster — {selected_role} ({len(df_evaluated):,} Total Evaluated)")
-    st.dataframe(
-        df_evaluated[["Rank", "Candidate ID", "Overall Score", "Recommendation", "Review Triage Status (C10)", "Experience (Years)", "Timeline Integrity Status", "Worker Type", "Career Gap (Years)", "Unit Screening Cost (C11)", "Labour Law 2025 Status"]].head(250),
-        use_container_width=True,
-        hide_index=True
-    )
-
-with tab2:
-    c1, c2 = st.columns(2)
-    with c1:
-        fig1, ax1 = plt.subplots(figsize=(7, 4.5), facecolor="#0b1120")
-        ax1.set_facecolor("#0b1120")
-        top_disp = df_evaluated.head(10).iloc[::-1]
-        color_map = {"SELECTED (Interview)": "#38bdf8", "BACKUP CANDIDATE": "#a78bfa", "REJECTED": "#64748b"}
-        bar_colors = [color_map.get(r, "#64748b") for r in top_disp["Recommendation"]]
-        bars = ax1.barh(top_disp["Candidate ID"].astype(str), top_disp["Overall Score"], color=bar_colors, height=0.55)
-        for bar in bars:
-            w = bar.get_width()
-            ax1.text(w + 1, bar.get_y() + bar.get_height()/2, f"{w:.1f}", va="center", color="#f8fafc", fontweight="bold", fontsize=9)
-        ax1.set_title("Ranked Scores (Cyan: Selected | Purple: Backup)", color="#ffffff", fontweight="bold", fontsize=11)
-        ax1.set_xlim(0, 115)
-        ax1.tick_params(colors="#cbd5e1", labelsize=8)
-        ax1.spines["top"].set_visible(False)
-        ax1.spines["right"].set_visible(False)
-        st.pyplot(fig1)
-
-    with c2:
-        fig2, ax2 = plt.subplots(figsize=(7, 4.5), facecolor="#0b1120")
-        ax2.set_facecolor("#0b1120")
-        triage_dist = df_evaluated["Review Triage Status (C10)"].value_counts()
-        ax2.pie(triage_dist.values, labels=triage_dist.index, autopct="%1.1f%%", colors=["#34d399", "#38bdf8", "#f59e0b", "#ef4444"][:len(triage_dist)], textprops={"color": "#f8fafc", "fontsize": 8}, startangle=140)
-        ax2.set_title("Constraint 10: Human Review Triage Load Distribution", color="#ffffff", fontweight="bold", fontsize=11)
-        st.pyplot(fig2)
-
-with tab3:
-    st.subheader("Constraint 11: Production Budget Breakdown (₹30,000 / Month Ceiling)")
-
-    col_b1, col_b2 = st.columns([1.2, 1.0])
-    with col_b1:
-        budget_df = pd.DataFrame({
-            "Infrastructure Component": ["Compute & API Services (ARM Graviton)", "Human Triage Review Buffer (C10)", "Database & Metadata Store (Postgres)", "Surge & Burst Elasticity Buffer (C9)", "Network, CDN & Edge Protection", "Security & Labour Law 2025 Redaction", "Storage & Parquet Archives"],
-            "Monthly Cost (₹)": [8200, 6000, 4500, 4000, 3000, 2500, 1800],
-            "Share (%)": ["27.3%", "20.0%", "15.0%", "13.4%", "10.0%", "8.3%", "6.0%"],
-            "Technical Justification": [
-                "4 vCPU / 16GB ARM server running local vectorized scoring engine.",
-                "Direct operational reviewer allocation for remaining 5% complex edge cases.",
-                "Managed ACID database for deduplication and audit logging.",
-                "On-demand elasticity buffer to absorb 50x overnight applicant surges.",
-                "Cloudflare edge caching + Prometheus telemetry against traffic spikes.",
-                "KMS encryption and regex demographic redaction under Labour Law 2025.",
-                "Columnar Apache Parquet storage for 100,000+ candidate profiles."
-            ]
-        })
-        st.dataframe(budget_df, use_container_width=True, hide_index=True)
-        st.markdown("**Total Cost: ₹30,000 / Month | Effective Unit Cost: ₹0.30 per screened candidate**")
-
-    with col_b2:
-        fig_b, ax_b = plt.subplots(figsize=(6, 4.5), facecolor="#0b1120")
-        ax_b.set_facecolor("#0b1120")
-        ax_b.pie(budget_df["Monthly Cost (₹)"], labels=budget_df["Infrastructure Component"].apply(lambda x: x.split(" (")[0]), autopct="%1.1f%%", colors=["#38bdf8", "#34d399", "#a78bfa", "#f59e0b", "#0284c7", "#ec4899", "#64748b"], textprops={"color": "#f8fafc", "fontsize": 8}, startangle=140)
-        ax_b.set_title("Budget Allocation Distribution", color="#ffffff", fontweight="bold", fontsize=11)
-        st.pyplot(fig_b)
-
-with tab4:
-    st.subheader("Generate & Download Master Legal Audit Matrix")
-    clean_role_name = re.sub(r'[^a-zA-Z0-9_]', '_', selected_role)
-    csv_bytes = df_evaluated.head(500).to_csv(index=False).encode('utf-8')
-    st.download_button(
-        "📥 Download Master Recruiter Decision Matrix (CSV)",
-        data=csv_bytes,
-        file_name=f"Round3_Recruiter_Decision_{clean_role_name}_11Constraints.csv"
-    )
-    st.success("✅ Complete Round 3 Audit Trail across all 11 Constraints ready for enterprise submission.")
+### Free LLM setup
+Add one key to `.streamlit/secrets.toml` (or Streamlit Cloud → Settings → Secrets):
+```toml
+GROQ_API_KEY = "..."        # or GEMINI_API_KEY / OPENROUTER_API_KEY
+```
+The AI reads resumes and job descriptions and writes assessments. **Scores stay rule-based** so every
+decision is reproducible and explainable.
+""")
